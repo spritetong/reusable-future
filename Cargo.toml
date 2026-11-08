@@ -1,0 +1,30 @@
+[package]
+name = "reusable-future"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.84.0"
+authors = ["Sprite Tong <spritetong@gmail.com>"]
+repository = "https://github.com/spritetong/reusable-future"
+license = "MIT OR Apache-2.0"
+description = "A memory-reusing, resettable future container designed for zero-allocation async loops and cancel-safe select! branches."
+readme = "README.md"
+keywords = ["async", "future", "zero-copy", "tokio", "select"]
+categories = [
+    "asynchronous",
+    "concurrency",
+    "memory-management",
+    "rust-patterns",
+]
+
+[features]
+default = []
+
+[dependencies]
+futures-util = { version = "0.3", default-features = false, features = [
+    "alloc",
+] }
+triomphe = { version = "0.1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
