@@ -1,8 +1,8 @@
 [package]
 name = "reusable-future"
 version = "1.0.0"
-edition = "2021"
-rust-version = "1.84.0"
+edition = "2024"
+rust-version = "1.85"
 authors = ["Sprite Tong <spritetong@gmail.com>"]
 repository = "https://github.com/spritetong/reusable-future"
 license = "MIT OR Apache-2.0"
