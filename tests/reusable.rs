@@ -189,3 +189,21 @@ async fn test_cross_type_switching() {
     let mut tuple_ref = pool.borrow(|| async { (100u64, vec![1u8, 2, 3]) });
     assert_eq!((&mut tuple_ref).await, (100u64, vec![1u8, 2, 3]));
 }
+
+struct MyZstFuture;
+impl std::future::Future for MyZstFuture {
+    type Output = i32;
+    fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<i32> {
+        std::task::Poll::Ready(123)
+    }
+}
+
+#[tokio::test]
+async fn test_zst_future() {
+    let mut slot: ReusableFutureRef<i32> = ReusableFutureRef::default();
+    assert!(slot.is_empty());
+
+    slot.set(|| MyZstFuture);
+    assert!(!slot.is_empty(), "MyZstFuture must NOT be considered empty!");
+    assert_eq!((&mut slot).await, 123);
+}

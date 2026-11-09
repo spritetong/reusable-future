@@ -270,6 +270,8 @@ impl Inner {
             // Reuse the existing allocation if it fits.
             raw_ptr = self.raw_ptr.cast::<F>();
         } else {
+            let old_layout = self.layout;
+
             // Deallocate the old memory if the new layout doesn't fit.
             self.deallocate();
 
@@ -277,8 +279,8 @@ impl Inner {
             layout = unsafe {
                 // Calculate the new layout to accommodate the new future.
                 Layout::from_size_align_unchecked(
-                    self.layout.size().max(layout.size()),
-                    self.layout.align().max(layout.align()),
+                    old_layout.size().max(layout.size()),
+                    old_layout.align().max(layout.align()),
                 )
             };
 
@@ -437,13 +439,26 @@ macro_rules! impl_reusable_future {
 
         impl<T> Unpin for $ReusableFutureRef<'_, T> {}
 
+        impl<T> $ReusableFutureRef<'_, T> {
+            /// Check if the underlying future is in an idle/empty state.
+            ///
+            /// Uses a null data-pointer sentinel to distinguish the reset/empty state
+            /// from any active future (including custom zero-sized futures) with zero overhead.
+            #[inline(always)]
+            pub fn is_empty(&self) -> bool {
+                self.dyn_ptr.cast::<()>().is_null()
+            }
+        }
+
         impl<T> Drop for $ReusableFutureRef<'_, T> {
             fn drop(&mut self) {
-                // SAFETY: `dyn_ptr` points to a valid, initialized `Future` instance of type `F`
+                // SAFETY: If not empty, `dyn_ptr` points to a valid, initialized `Future` instance
                 // (though accessed as a trait object). `drop_in_place` correctly drops the future.
                 // This must happen before `borrowed` is set to false, as the memory might be reused immediately after.
                 unsafe {
-                    ptr::drop_in_place(self.dyn_ptr);
+                    if !self.is_empty() {
+                        ptr::drop_in_place(self.dyn_ptr);
+                    }
 
                     // Release the borrow on the owner's inner state.
                     let inner = self.owner.as_mut();
@@ -463,6 +478,10 @@ macro_rules! impl_reusable_future {
             fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
                 let this = Pin::into_inner(self);
 
+                if this.is_empty() {
+                    return Poll::Pending;
+                }
+
                 // SAFETY: `dyn_ptr` points to a valid `Future` instance. The `ReusableFutureRef`
                 // ensures the data pointed to by `dyn_ptr` is valid for the lifetime of `self`.
                 // Pinning `dyn_ptr` is safe because the `ReusableFutureRef` itself is pinned,
@@ -479,7 +498,9 @@ macro_rules! impl_reusable_future {
             T: $($SendBound)*,
         {
             fn default() -> Self {
-                $ReusableFuture::default().borrow(pending)
+                let mut reusable = $ReusableFuture::default().borrow(pending);
+                reusable.reset();
+                reusable
             }
         }
 
@@ -507,25 +528,17 @@ macro_rules! impl_reusable_future {
                 $ReusableFuture::with_layout(Layout::new::<F>()).borrow(future_creator)
             }
 
-            /// Check if the underlying future is zero-sized (e.g., `Pending`).
-            ///
-            /// This is often used to check if the future is in a "default" or "reset" state.
-            pub fn is_empty(&self) -> bool {
-                unsafe { Layout::for_value(&*self.dyn_ptr).size() == 0 }
-            }
-
-            /// Resets the future to `Pending`.
+            /// Resets the future to idle/empty.
             ///
             /// This effectively resets the current future and releases any resources
-            /// held by it, replacing it with a zero-sized `Pending` future.
+            /// held by it, setting it to the idle state.
             pub fn reset(&mut self) {
-                // SAFETY: `dyn_ptr` points to a valid, initialized `Future` instance
-                // (though accessed as a trait object). `drop_in_place` correctly drops the future.
-                unsafe {
-                    ptr::drop_in_place(self.dyn_ptr);
-                    // `Pending<T>` is zero-sized, so we can just cast the pointer
-                    self.dyn_ptr = (self.dyn_ptr as *mut Pending<T>)
-                        as *mut dyn Future<Output = T>;
+                if !self.is_empty() {
+                    // SAFETY: `dyn_ptr` points to a valid, initialized `Future` instance.
+                    unsafe {
+                        ptr::drop_in_place(self.dyn_ptr);
+                        self.dyn_ptr = ptr::null_mut::<Pending<T>>() as *mut dyn Future<Output = T>;
+                    }
                 }
             }
 
@@ -544,10 +557,12 @@ macro_rules! impl_reusable_future {
                 F: Future<Output = T> + 'a + $($SendBound)*,
                 C: FnOnce() -> F,
             {
-                // SAFETY: `dyn_ptr` points to a valid, initialized `Future` instance
-                // (though accessed as a trait object). `drop_in_place` correctly drops the future.
+                // SAFETY: If not empty, `dyn_ptr` points to a valid, initialized `Future` instance.
+                // `drop_in_place` correctly drops the future.
                 unsafe {
-                    ptr::drop_in_place(self.dyn_ptr);
+                    if !self.is_empty() {
+                        ptr::drop_in_place(self.dyn_ptr);
+                    }
 
                     // Reallocate the memory if needed.
                     // SAFETY: See `as_mut` safety notes. The Ref maintains the borrow.
@@ -577,11 +592,3 @@ macro_rules! impl_reusable_future {
 
 impl_reusable_future!(ReusableFuture, ReusableFutureRef, Arc, true, Send);
 impl_reusable_future!(ReusableRcFuture, ReusableRcFutureRef, Rc, false,);
-
-// static assertion
-const _: () = {
-    use std::mem::{needs_drop, size_of};
-    if size_of::<Pending<String>>() != 0 || needs_drop::<Pending<String>>() {
-        panic!("`Pending` must be zero-sized and not need drop!");
-    }
-};
