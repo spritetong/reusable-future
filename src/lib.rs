@@ -142,7 +142,7 @@
 //! # }
 //! ```
 
-use futures_util::future::{Pending, pending};
+use futures_util::future::Pending;
 use std::alloc::Layout;
 use std::cell::UnsafeCell;
 use std::mem::align_of;
@@ -224,19 +224,6 @@ pub struct ReusableRcFutureRef<'a, T> {
     _phantom: std::marker::PhantomData<&'a T>, // Use &'a T to tie the lifetime
 }
 
-macro_rules! allocate {
-    ($raw_ptr:ident, $layout:ident, $F:ty) => {
-        if $layout.size() > 0 {
-            // SAFETY: `layout` is valid for type F. The global allocator is used.
-            $raw_ptr = unsafe { std::alloc::alloc($layout).cast::<$F>() };
-            assert!(!$raw_ptr.is_null(), "Failed to allocate memory");
-        } else {
-            // Use dangling pointer for ZSTs.
-            $raw_ptr = ptr::dangling_mut::<$F>();
-        }
-    };
-}
-
 #[cfg(any(target_pointer_width = "16", target_pointer_width = "32"))]
 type MinAlignType = f64;
 #[cfg(not(any(target_pointer_width = "16", target_pointer_width = "32")))]
@@ -262,49 +249,67 @@ impl Drop for Inner {
 impl Inner {
     // Reallocate the memory if needed.
     fn reallocate<F>(&mut self) -> *mut F {
-        let raw_ptr: *mut F;
+        let layout = Layout::new::<F>();
 
-        // Check if the new future's layout fits the *original* allocation's layout.
-        let mut layout = Layout::new::<F>();
-        if self.layout.size() >= layout.size() && self.layout.align() >= layout.align() {
+        if layout.size() == 0 {
+            return ptr::dangling_mut::<F>();
+        }
+
+        let raw_ptr: *mut F;
+        if !self.raw_ptr.is_null()
+            && self.layout.size() >= layout.size()
+            && self.layout.align() >= layout.align()
+        {
             // Reuse the existing allocation if it fits.
             raw_ptr = self.raw_ptr.cast::<F>();
         } else {
-            let old_layout = self.layout;
-
             // Deallocate the old memory if the new layout doesn't fit.
             self.deallocate();
 
-            // SAFETY: The layout is guaranteed to be valid, so no validation check is required.
-            layout = unsafe {
+            unsafe {
+                // SAFETY: The layout is guaranteed to be valid, so no validation check is required.
                 // Calculate the new layout to accommodate the new future.
-                Layout::from_size_align_unchecked(
-                    old_layout.size().max(layout.size()),
-                    old_layout.align().max(layout.align()),
-                )
+                let new_layout = Layout::from_size_align_unchecked(
+                    self.layout.size().max(layout.size()),
+                    self.layout.align().max(layout.align()),
+                );
+
+                // SAFETY: `new_layout.size() > 0`, global allocator is used.
+                let ptr = std::alloc::alloc(new_layout).cast::<F>();
+                assert!(!ptr.is_null(), "Failed to allocate memory");
+                raw_ptr = ptr;
+
+                // Update the inner state with the new layout and pointer.
+                self.layout = new_layout;
+                self.raw_ptr = raw_ptr.cast();
             };
-
-            // Allocate new memory for the future.
-            allocate!(raw_ptr, layout, F);
-
-            // Update the inner state with the new layout and pointer.
-            self.layout = layout;
-            self.raw_ptr = raw_ptr.cast();
         }
 
         raw_ptr
     }
 
     /// Deallocates the memory pointed to by `raw_ptr` if it's valid and the layout size is greater than 0.
+    #[inline]
     fn deallocate(&mut self) {
-        if self.layout.size() > 0 {
+        if !self.raw_ptr.is_null() {
             // SAFETY: `raw_ptr` was allocated with `layout` using the global allocator,
             // and it hasn't been deallocated yet (since `raw_ptr` is not null).
-            // The size is checked to avoid deallocating zero-sized allocations.
             unsafe { std::alloc::dealloc(self.raw_ptr, self.layout) };
-            // Set layout size to zero to prevent double deallocation.
-            self.layout = Layout::new::<[MinAlignType; 0]>();
-            self.raw_ptr = ptr::dangling_mut::<MinAlignType>().cast();
+            self.raw_ptr = ptr::null_mut();
+        }
+    }
+
+    // Mark the allocation as borrowed.
+    #[inline(always)]
+    fn check_and_mark_borrowed<const ATOMIC: bool>(&self) {
+        // AtomicBool::swap returns the PREVIOUS value. If it was true, it's already borrowed.
+        let borrowed = if ATOMIC {
+            self.borrowed.swap(true, Ordering::AcqRel)
+        } else {
+            self.borrowed.swap(true, Ordering::Relaxed)
+        };
+        if borrowed {
+            panic!("ReusableFuture has been borrowed");
         }
     }
 }
@@ -340,20 +345,26 @@ macro_rules! impl_reusable_future {
             ///
             /// A new `ReusableFuture` instance with allocated memory according to `layout`.
             pub fn with_layout(layout: Layout) -> Self {
-                // SAFETY: The layout is guaranteed to be valid, so no validation check is required.
-                let layout = unsafe {
+                let mut raw_ptr: *mut MinAlignType = ptr::null_mut();
+                let effective_layout: Layout;
+
+                unsafe {
+                    // SAFETY: The layout is guaranteed to be valid, so no validation check is required.
                     // Adjust the layout to ensure it meets the minimum alignment requirements.
-                    Layout::from_size_align_unchecked(
+                    effective_layout = Layout::from_size_align_unchecked(
                         layout.size(),
                         layout.align().max(align_of::<MinAlignType>()),
-                    )
-                };
+                    );
 
-                let raw_ptr: *mut MinAlignType;
-                allocate!(raw_ptr, layout, MinAlignType);
+                    if effective_layout.size() > 0 {
+                        // SAFETY: `effective_layout.size() > 0`, global allocator is used.
+                        raw_ptr = std::alloc::alloc(effective_layout).cast::<MinAlignType>();
+                        assert!(!raw_ptr.is_null(), "Failed to allocate memory");
+                    }
+                }
 
                 Self($Rc::new(UnsafeCell::new(Inner {
-                    layout,
+                    layout: effective_layout,
                     raw_ptr: raw_ptr.cast(),
                     borrowed: AtomicBool::new(false),
                 })))
@@ -387,31 +398,17 @@ macro_rules! impl_reusable_future {
             {
                 let raw_ptr: *mut F;
 
-                // SAFETY: `ReusableFuture` is not `Sync`, so as_mut() is only safe if there is
-                // no concurrent access. The `borrowed` flag is used below as a runtime check
-                // to prevent multiple simultaneous borrows, even on the same thread or
-                // across threads if the user incorrectly tries to share it.
                 unsafe {
+                    // SAFETY: Exclusive access is guaranteed by `check_and_mark_borrowed`.
                     let inner = self.as_mut();
-
-                    // Mark the allocation as borrowed.
-                    // AtomicBool::swap returns the PREVIOUS value. If it was true, it's already borrowed.
-                    let borrowed = if $atomic {
-                        inner.borrowed.swap(true, Ordering::AcqRel)
-                    } else {
-                        std::mem::replace(inner.borrowed.get_mut(), true)
-                    };
-                    if borrowed {
-                        panic!("ReusableFuture has been borrowed");
-                    }
+                    inner.check_and_mark_borrowed::<$atomic>();
 
                     // Reallocate the memory if needed.
                     raw_ptr = inner.reallocate::<F>();
 
-                    // SAFETY: `raw_ptr` points to a valid memory block (either newly allocated or reused)
-                    // with the correct layout for `F`. The memory is not currently holding a valid `F`
-                    // (it's either uninitialized or contains remnants of a previous future that was dropped).
-                    // `ptr::write` overwrites the memory without reading or dropping the old content.
+                    // SAFETY: `raw_ptr` points to a valid memory block (either newly allocated, reused,
+                    // or a properly aligned dangling pointer for zero-sized types).
+                    // `ptr::write` overwrites the memory without reading or dropping old content.
                     ptr::write(raw_ptr, future_creator());
                 }
 
@@ -423,13 +420,41 @@ macro_rules! impl_reusable_future {
                 }
             }
 
+            /// Borrows the container in an idle/empty state without initializing a future immediately.
+            ///
+            /// The returned [`$ReusableFutureRef`] will be in an empty state (where
+            /// [`is_empty()`](Self::is_empty) returns `true`) and yields [`Poll::Pending`]
+            /// when polled until a concrete future is assigned via [`set()`](Self::set).
+            ///
+            /// This allows pre-acquiring or reserving the future slot without incurring the
+            /// cost of constructing a dummy future or triggering redundant heap allocations.
+            ///
+            /// # Returns
+            ///
+            /// A new reference wrapper in the idle/empty state. The borrow is held until
+            /// the reference is dropped.
+            ///
+            /// # Panics
+            ///
+            /// Panics if the container is already borrowed.
+            pub fn borrow_empty<'a, T>(self) -> $ReusableFutureRef<'a, T> {
+                unsafe {
+                    // SAFETY: Exclusive access is guaranteed by `check_and_mark_borrowed`.
+                    self.as_mut().check_and_mark_borrowed::<$atomic>();
+                }
+
+                $ReusableFutureRef {
+                    owner: self,
+                    dyn_ptr: ptr::null_mut::<Pending<T>>() as *mut dyn Future<Output = T>,
+                    _phantom: std::marker::PhantomData,
+                }
+            }
+
             /// # Safety
             ///
             /// This method returns a mutable reference from a shared reference.
             /// It is only safe to use if the caller ensures that no other mutable or shared
-            /// references to the `Inner` data exist. `ReusableFuture` is not `Sync`,
-            /// so this is generally safe within a single thread, and the `borrowed`
-            /// flag provides a runtime check against concurrent access.
+            /// references to the `Inner` data exist.
             #[allow(clippy::mut_from_ref)]
             #[inline(always)]
             unsafe fn as_mut(&self) -> &mut Inner { unsafe {
@@ -452,10 +477,10 @@ macro_rules! impl_reusable_future {
 
         impl<T> Drop for $ReusableFutureRef<'_, T> {
             fn drop(&mut self) {
-                // SAFETY: If not empty, `dyn_ptr` points to a valid, initialized `Future` instance
-                // (though accessed as a trait object). `drop_in_place` correctly drops the future.
-                // This must happen before `borrowed` is set to false, as the memory might be reused immediately after.
                 unsafe {
+                    // SAFETY: If not empty, `dyn_ptr` points to a valid, initialized `Future` instance
+                    // (though accessed as a trait object). `drop_in_place` correctly drops the future.
+                    // This must happen before `borrowed` is set to false, as the memory might be reused immediately after.
                     if !self.is_empty() {
                         ptr::drop_in_place(self.dyn_ptr);
                     }
@@ -463,9 +488,9 @@ macro_rules! impl_reusable_future {
                     // Release the borrow on the owner's inner state.
                     let inner = self.owner.as_mut();
                     if $atomic {
-                        inner.borrowed.store(false, Ordering::Release)
+                        inner.borrowed.store(false, Ordering::Release);
                     } else {
-                        *inner.borrowed.get_mut() = false;
+                        inner.borrowed.store(false, Ordering::Relaxed);
                     }
                 }
             }
@@ -498,9 +523,7 @@ macro_rules! impl_reusable_future {
             T: $($SendBound)*,
         {
             fn default() -> Self {
-                let mut reusable = $ReusableFuture::default().borrow(pending);
-                reusable.reset();
-                reusable
+                $ReusableFuture::default().borrow_empty()
             }
         }
 
@@ -557,20 +580,19 @@ macro_rules! impl_reusable_future {
                 F: Future<Output = T> + 'a + $($SendBound)*,
                 C: FnOnce() -> F,
             {
-                // SAFETY: If not empty, `dyn_ptr` points to a valid, initialized `Future` instance.
-                // `drop_in_place` correctly drops the future.
                 unsafe {
+                    // SAFETY: If not empty, `dyn_ptr` points to a valid, initialized `Future` instance.
+                    // `drop_in_place` correctly drops the future.
                     if !self.is_empty() {
                         ptr::drop_in_place(self.dyn_ptr);
                     }
 
-                    // Reallocate the memory if needed.
                     // SAFETY: See `as_mut` safety notes. The Ref maintains the borrow.
+                    // Reallocate the memory if needed.
                     let raw_ptr = self.owner.as_mut().reallocate::<F>();
 
-                    // SAFETY: `raw_ptr` points to a valid memory block (either newly allocated or reused)
-                    // with the correct layout for `F`. The memory is not currently holding a valid `F`
-                    // (it's either uninitialized or contains remnants of a previous future that was dropped).
+                    // SAFETY: `raw_ptr` points to a valid memory block (either newly allocated, reused,
+                    // or a properly aligned dangling pointer for zero-sized types).
                     // `ptr::write` overwrites the memory without reading or dropping the old content.
                     ptr::write(raw_ptr, future_creator());
 

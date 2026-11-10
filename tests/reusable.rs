@@ -193,7 +193,10 @@ async fn test_cross_type_switching() {
 struct MyZstFuture;
 impl std::future::Future for MyZstFuture {
     type Output = i32;
-    fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<i32> {
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<i32> {
         std::task::Poll::Ready(123)
     }
 }
@@ -204,6 +207,109 @@ async fn test_zst_future() {
     assert!(slot.is_empty());
 
     slot.set(|| MyZstFuture);
-    assert!(!slot.is_empty(), "MyZstFuture must NOT be considered empty!");
+    assert!(
+        !slot.is_empty(),
+        "MyZstFuture must NOT be considered empty!"
+    );
     assert_eq!((&mut slot).await, 123);
+}
+
+#[tokio::test]
+async fn test_borrow_empty_behavior() {
+    let pool = ReusableFuture::new();
+    let mut slot: ReusableFutureRef<i32> = pool.borrow_empty();
+    assert!(slot.is_empty());
+
+    // Polling an empty slot returns Poll::Pending
+    let waker = futures_util::task::noop_waker();
+    let mut cx = std::task::Context::from_waker(&waker);
+    assert_eq!(
+        std::pin::Pin::new(&mut slot).poll(&mut cx),
+        std::task::Poll::Pending
+    );
+
+    // Setting a future transitions it to active
+    slot.set(|| async { 42 });
+    assert!(!slot.is_empty());
+    assert_eq!((&mut slot).await, 42);
+
+    // Reset transitions it back to empty
+    slot.reset();
+    assert!(slot.is_empty());
+
+    // Reclaim returns ownership to the pool and enables new borrows
+    let owner = slot.reclaim();
+    let mut slot2: ReusableFutureRef<String> = owner.borrow_empty();
+    assert!(slot2.is_empty());
+    slot2.set(|| async { String::from("reclaimed") });
+    assert_eq!((&mut slot2).await, "reclaimed");
+}
+
+#[tokio::test]
+async fn test_zst_future_evaluation_and_drop() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    static ZST_DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+    struct ZstDropFuture;
+
+    impl std::future::Future for ZstDropFuture {
+        type Output = ();
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<()> {
+            std::task::Poll::Ready(())
+        }
+    }
+
+    impl Drop for ZstDropFuture {
+        fn drop(&mut self) {
+            ZST_DROPPED.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    assert_eq!(std::mem::size_of::<ZstDropFuture>(), 0);
+
+    let created = Arc::new(AtomicBool::new(false));
+    let created_clone = Arc::clone(&created);
+
+    let pool = ReusableFuture::new();
+    // Test borrow with ZST on an unallocated pool: closure must run!
+    let mut slot = pool.borrow(move || {
+        created_clone.store(true, Ordering::SeqCst);
+        ZstDropFuture
+    });
+
+    assert!(
+        created.load(Ordering::SeqCst),
+        "ZST closure must be evaluated"
+    );
+    assert!(!slot.is_empty());
+    assert_eq!(ZST_DROPPED.load(Ordering::SeqCst), 0);
+
+    // Polling completes the future
+    (&mut slot).await;
+
+    // Reset drops the future
+    slot.reset();
+    assert_eq!(ZST_DROPPED.load(Ordering::SeqCst), 1);
+    assert!(slot.is_empty());
+
+    // Test slot.set with ZST on an empty slot
+    let set_created = Arc::new(AtomicBool::new(false));
+    let set_created_clone = Arc::clone(&set_created);
+    slot.set(move || {
+        set_created_clone.store(true, Ordering::SeqCst);
+        ZstDropFuture
+    });
+    assert!(
+        set_created.load(Ordering::SeqCst),
+        "ZST closure in set() must be evaluated"
+    );
+    assert!(!slot.is_empty());
+
+    drop(slot);
+    assert_eq!(ZST_DROPPED.load(Ordering::SeqCst), 2);
 }
