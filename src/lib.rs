@@ -473,18 +473,29 @@ macro_rules! impl_reusable_future {
             pub fn is_empty(&self) -> bool {
                 self.dyn_ptr.cast::<()>().is_null()
             }
+
+            /// Resets the future to idle/empty.
+            ///
+            /// This effectively resets the current future and releases any resources
+            /// held by it, setting it to the idle state.
+            pub fn reset(&mut self) {
+                if !self.is_empty() {
+                    // SAFETY: `dyn_ptr` points to a valid, initialized `Future` instance.
+                    unsafe {
+                        ptr::drop_in_place(self.dyn_ptr);
+                        self.dyn_ptr = ptr::null_mut::<Pending<T>>() as *mut dyn Future<Output = T>;
+                    }
+                }
+            }
         }
 
         impl<T> Drop for $ReusableFutureRef<'_, T> {
             fn drop(&mut self) {
-                unsafe {
-                    // SAFETY: If not empty, `dyn_ptr` points to a valid, initialized `Future` instance
-                    // (though accessed as a trait object). `drop_in_place` correctly drops the future.
-                    // This must happen before `borrowed` is set to false, as the memory might be reused immediately after.
-                    if !self.is_empty() {
-                        ptr::drop_in_place(self.dyn_ptr);
-                    }
+                // Drop the internal future if it exists.
+                self.reset();
 
+                unsafe {
+                    // SAFETY: mutable `self` holds the unique reference to the owner's inner state.
                     // Release the borrow on the owner's inner state.
                     let inner = self.owner.as_mut();
                     if $atomic {
@@ -551,20 +562,6 @@ macro_rules! impl_reusable_future {
                 $ReusableFuture::with_layout(Layout::new::<F>()).borrow(future_creator)
             }
 
-            /// Resets the future to idle/empty.
-            ///
-            /// This effectively resets the current future and releases any resources
-            /// held by it, setting it to the idle state.
-            pub fn reset(&mut self) {
-                if !self.is_empty() {
-                    // SAFETY: `dyn_ptr` points to a valid, initialized `Future` instance.
-                    unsafe {
-                        ptr::drop_in_place(self.dyn_ptr);
-                        self.dyn_ptr = ptr::null_mut::<Pending<T>>() as *mut dyn Future<Output = T>;
-                    }
-                }
-            }
-
             /// Set a new future for the `ReusableFutureRef`.
             ///
             /// # Arguments
@@ -580,14 +577,11 @@ macro_rules! impl_reusable_future {
                 F: Future<Output = T> + 'a + $($SendBound)*,
                 C: FnOnce() -> F,
             {
-                unsafe {
-                    // SAFETY: If not empty, `dyn_ptr` points to a valid, initialized `Future` instance.
-                    // `drop_in_place` correctly drops the future.
-                    if !self.is_empty() {
-                        ptr::drop_in_place(self.dyn_ptr);
-                    }
+                // Drop the internal future if it exists.
+                self.reset();
 
-                    // SAFETY: See `as_mut` safety notes. The Ref maintains the borrow.
+                unsafe {
+                    // SAFETY: mutable `self` holds the unique reference to the owner's inner state.
                     // Reallocate the memory if needed.
                     let raw_ptr = self.owner.as_mut().reallocate::<F>();
 
