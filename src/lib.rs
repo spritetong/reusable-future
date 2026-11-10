@@ -294,8 +294,12 @@ impl Inner {
         if !self.raw_ptr.is_null() {
             // SAFETY: `raw_ptr` was allocated with `layout` using the global allocator,
             // and it hasn't been deallocated yet (since `raw_ptr` is not null).
-            unsafe { std::alloc::dealloc(self.raw_ptr, self.layout) };
-            self.raw_ptr = ptr::null_mut();
+            unsafe {
+                std::alloc::dealloc(
+                    std::mem::replace(&mut self.raw_ptr, ptr::null_mut()),
+                    self.layout,
+                )
+            };
         }
     }
 
@@ -464,31 +468,6 @@ macro_rules! impl_reusable_future {
 
         impl<T> Unpin for $ReusableFutureRef<'_, T> {}
 
-        impl<T> $ReusableFutureRef<'_, T> {
-            /// Check if the underlying future is in an idle/empty state.
-            ///
-            /// Uses a null data-pointer sentinel to distinguish the reset/empty state
-            /// from any active future (including custom zero-sized futures) with zero overhead.
-            #[inline(always)]
-            pub fn is_empty(&self) -> bool {
-                self.dyn_ptr.cast::<()>().is_null()
-            }
-
-            /// Resets the future to idle/empty.
-            ///
-            /// This effectively resets the current future and releases any resources
-            /// held by it, setting it to the idle state.
-            pub fn reset(&mut self) {
-                if !self.is_empty() {
-                    // SAFETY: `dyn_ptr` points to a valid, initialized `Future` instance.
-                    unsafe {
-                        ptr::drop_in_place(self.dyn_ptr);
-                        self.dyn_ptr = ptr::null_mut::<Pending<T>>() as *mut dyn Future<Output = T>;
-                    }
-                }
-            }
-        }
-
         impl<T> Drop for $ReusableFutureRef<'_, T> {
             fn drop(&mut self) {
                 // Drop the internal future if it exists.
@@ -535,6 +514,44 @@ macro_rules! impl_reusable_future {
         {
             fn default() -> Self {
                 $ReusableFuture::default().borrow_empty()
+            }
+        }
+
+        impl<T> $ReusableFutureRef<'_, T> {
+            /// Check if the underlying future is in an idle/empty state.
+            ///
+            /// Uses a null data-pointer sentinel to distinguish the reset/empty state
+            /// from any active future (including custom zero-sized futures) with zero overhead.
+            #[inline(always)]
+            pub fn is_empty(&self) -> bool {
+                self.dyn_ptr.cast::<()>().is_null()
+            }
+
+            /// Resets the future to idle/empty.
+            ///
+            /// This effectively resets the current future and releases any resources
+            /// held by it, setting it to the idle state.
+            pub fn reset(&mut self) {
+                if !self.is_empty() {
+                    // SAFETY: `dyn_ptr` points to a valid, initialized `Future` instance.
+                    unsafe {
+                        ptr::drop_in_place(
+                            std::mem::replace(
+                                &mut self.dyn_ptr,
+                                ptr::null_mut::<Pending<T>>() as *mut dyn Future<Output = T>
+                            )
+                        );
+                    }
+                }
+            }
+
+            /// Drop the `ReusableFutureRef` but reclaim the allocated memory.
+            ///
+            /// # Returns
+            ///
+            /// The `ReusableFuture` instance which holds the allocated (reusable) memory.
+            pub fn reclaim(self) -> $ReusableFuture {
+                self.owner.clone()
             }
         }
 
@@ -592,15 +609,6 @@ macro_rules! impl_reusable_future {
 
                     self.dyn_ptr = raw_ptr as *mut dyn Future<Output = T>;
                 }
-            }
-
-            /// Drop the `ReusableFutureRef` but reclaim the allocated memory.
-            ///
-            /// # Returns
-            ///
-            /// The `ReusableFuture` instance which holds the allocated (reusable) memory.
-            pub fn reclaim(self) -> $ReusableFuture {
-                self.owner.clone()
             }
         }
     };
