@@ -15,12 +15,16 @@ async fn test_reusable_future_basic() {
     slot.set(|| async { 10 });
     assert!(!slot.is_empty());
     assert_eq!((&mut slot).await, 10);
+    // Since ReusableFutureRef is fused by default, awaiting it to completion automatically resets it
+    assert!(slot.is_empty());
 
     // Second execution reusing memory
     slot.set(|| async { 20 });
+    assert!(!slot.is_empty());
     assert_eq!((&mut slot).await, 20);
+    assert!(slot.is_empty());
 
-    // Reset back to empty
+    // Reset back to empty is idempotent
     slot.reset();
     assert!(slot.is_empty());
 }
@@ -115,8 +119,9 @@ async fn test_select_cancellation_safety() {
 
         tokio::select! {
             biased;
-            res = &mut slot, if !slot.is_empty() => {
-                slot.reset();
+            // No if guard needed: empty slot yields Pending without waking
+            // Auto-reset happens automatically upon Poll::Ready
+            res = &mut slot => {
                 assert_eq!(res, "success");
                 break;
             }
@@ -127,6 +132,9 @@ async fn test_select_cancellation_safety() {
             }
         }
     }
+
+    // After breaking out upon completion, slot is automatically reset to empty
+    assert!(slot.is_empty());
 
     // Other events should have fired several times (~4-6 times)
     assert!(
@@ -289,10 +297,12 @@ async fn test_zst_future_evaluation_and_drop() {
     assert!(!slot.is_empty());
     assert_eq!(ZST_DROPPED.load(Ordering::SeqCst), 0);
 
-    // Polling completes the future
+    // Polling completes the future and automatically drops it (fused behavior)
     (&mut slot).await;
+    assert_eq!(ZST_DROPPED.load(Ordering::SeqCst), 1);
+    assert!(slot.is_empty());
 
-    // Reset drops the future
+    // Calling reset() again is a safe, idempotent no-op
     slot.reset();
     assert_eq!(ZST_DROPPED.load(Ordering::SeqCst), 1);
     assert!(slot.is_empty());
@@ -312,4 +322,114 @@ async fn test_zst_future_evaluation_and_drop() {
 
     drop(slot);
     assert_eq!(ZST_DROPPED.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn test_fused_adapter_explicit() {
+    let mut slot: ReusableFutureRef<i32> = ReusableFutureRef::default();
+    slot.set(|| async { 42 });
+
+    // slot.fused() returns &mut Self, which auto-resets on Ready (fused)
+    assert_eq!(slot.fused().await, 42);
+    assert!(slot.is_empty());
+
+    // Using slot.fused() inside tokio::select!
+    slot.set(|| async { 100 });
+    tokio::select! {
+        biased;
+        res = slot.fused() => {
+            assert_eq!(res, 100);
+        }
+    }
+    assert!(slot.is_empty());
+}
+
+// A custom multi-step future that yields multiple Ready outputs across repeated polls
+struct MultiStepFuture {
+    count: usize,
+}
+
+impl std::future::Future for MultiStepFuture {
+    type Output = usize;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<usize> {
+        self.count += 1;
+        std::task::Poll::Ready(self.count)
+    }
+}
+
+#[tokio::test]
+async fn test_unfused_adapter_multi_poll() {
+    let mut slot: ReusableFutureRef<usize> = ReusableFutureRef::default();
+    slot.set(|| MultiStepFuture { count: 0 });
+    assert!(!slot.is_empty());
+
+    // 1. First poll via unfused(): must NOT reset the slot!
+    assert_eq!(slot.unfused().await, 1);
+    assert!(!slot.is_empty(), "Unfused future must NOT be reset on completion");
+
+    // 2. Second poll via unfused(): same future instance, state preserved!
+    assert_eq!(slot.unfused().await, 2);
+    assert!(!slot.is_empty());
+
+    // 3. Third poll via unfused()
+    assert_eq!(slot.unfused().await, 3);
+    assert!(!slot.is_empty());
+
+    // 4. Manually reset back to empty
+    slot.reset();
+    assert!(slot.is_empty());
+}
+
+#[tokio::test]
+async fn test_unfused_adapter_in_select() {
+    let mut slot: ReusableFutureRef<usize> = ReusableFutureRef::default();
+    slot.set(|| MultiStepFuture { count: 10 });
+
+    let mut results = Vec::new();
+    for _ in 0..3 {
+        tokio::select! {
+            biased;
+            res = slot.unfused() => {
+                results.push(res);
+            }
+        }
+        // Future must still be in the slot across loop iterations
+        assert!(!slot.is_empty());
+    }
+
+    assert_eq!(results, vec![11, 12, 13]);
+    slot.reset();
+    assert!(slot.is_empty());
+}
+
+#[tokio::test]
+async fn test_rc_fused_and_unfused() {
+    let local = tokio::task::LocalSet::new();
+
+    local
+        .run_until(async {
+            let mut slot = reusable_future::ReusableRcFutureRef::default();
+            slot.set(|| async { "rc_fused" });
+
+            // fused() auto-resets
+            assert_eq!(slot.fused().await, "rc_fused");
+            assert!(slot.is_empty());
+
+            // unfused() preserves future
+            let mut slot2: reusable_future::ReusableRcFutureRef<usize> =
+                reusable_future::ReusableRcFutureRef::default();
+            slot2.set(|| MultiStepFuture { count: 5 });
+            assert_eq!(slot2.unfused().await, 6);
+            assert!(!slot2.is_empty());
+            assert_eq!(slot2.unfused().await, 7);
+            assert!(!slot2.is_empty());
+
+            slot2.reset();
+            assert!(slot2.is_empty());
+        })
+        .await;
 }

@@ -19,7 +19,8 @@ This enables **zero-allocation reuse** across repetitive async loops, **cross-ty
 | **Cross-Type Switching** | **Yes (switch between `T1`, `T2`, `T3` with 0 re-allocations)** | ❌ No (strictly locked to a single type `T`) |
 | **Idle / Pending State** | **Yes (`is_empty()`, default is ZST `Pending`)** | ❌ No (must always contain an active future) |
 | **In-place Reset** | **Yes (`reset()`)** | ❌ No |
-| **Cancellation Safety in `select!`** | **Yes (`res = &mut slot, if !slot.is_empty()`)** | ⚠️ Awkward / Error-prone |
+| **Cancellation Safety in `select!`** | **Yes (`res = &mut slot =>`, auto-resets, no guard needed)** | ⚠️ Awkward / Error-prone |
+| **Fused & Unfused Modes** | **Yes (`.fused()` default, `.unfused()` for multi-step)** | ❌ No |
 | **Two Usage Models** | **Flexible: hold `ReusableFuture` (multi-type) OR `ReusableFutureRef` (single-type)** | ❌ Only single typed struct |
 | **Single-Threaded Optimization** | **Yes (`ReusableRcFuture`, zero atomics)** | ❌ No (`Send` only) |
 | **Arc Optimization** | **Optional `triomphe::Arc` (1 word pointer)** | Standard `alloc::sync::Arc` (2 words) |
@@ -82,8 +83,7 @@ async fn main() {
     assert!(!slot.is_empty());
     assert_eq!((&mut slot).await, 10);
 
-    // Reset back to empty without deallocating the underlying memory block
-    slot.reset();
+    // Completing a future automatically resets it back to idle (fused by default)
     assert!(slot.is_empty());
 
     // Reuse the existing allocated memory for another future of the same type (0 heap allocations)
@@ -98,7 +98,7 @@ async fn main() {
 
 In high-concurrency network services, running an asynchronous operation (such as a handshake or connect) directly inside `tokio::select!` leads to premature aborts and resource leaks when other branches fire first.
 
-By keeping `ReusableFutureRef` outside the loop, the in-flight operation **persists across iterations**:
+By keeping `ReusableFutureRef` outside the loop, the in-flight operation **persists across iterations**. Because it is fused by default, **no `if guard` or manual `reset()` is needed**:
 
 ```rust
 use reusable_future::ReusableFutureRef;
@@ -121,9 +121,8 @@ async fn main() {
 
         tokio::select! {
             biased;
-            // Only polls when an active operation is in-flight
-            res = &mut conn_slot, if !conn_slot.is_empty() => {
-                conn_slot.reset(); // Reclaim memory and set back to idle
+            // Clean syntax: auto-resets on completion, empty slot returns Poll::Pending
+            res = &mut conn_slot => {
                 println!("Result: {}", res);
                 break;
             }
@@ -135,6 +134,15 @@ async fn main() {
     }
 }
 ```
+
+---
+
+## 🔄 Fused vs Unfused Modes
+
+* **Fused mode (Default / `slot.fused()`)**:
+  When polled to completion (`Poll::Ready`), the slot automatically resets to the idle/empty state, dropping the inner future and reclaiming memory for subsequent `set()` calls. When idle, polling yields `Poll::Pending` without panicking.
+* **Unfused mode (`slot.unfused()`)**:
+  When polled via `slot.unfused()`, returning `Poll::Ready` will **NOT** reset the slot. The future remains active in the container, allowing it to be polled repeatedly (useful for custom multi-step state machines, streaming, or custom reset timing) until manually cleared via `slot.reset()`.
 
 ---
 

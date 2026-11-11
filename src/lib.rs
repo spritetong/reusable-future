@@ -70,8 +70,7 @@
 //! assert!(!slot.is_empty());
 //! assert_eq!((&mut slot).await, 10);
 //!
-//! // Reset back to empty without deallocating the underlying memory block
-//! slot.reset();
+//! // Completing a future automatically resets it back to idle (fused by default)
 //! assert!(slot.is_empty());
 //!
 //! // Reuse the existing allocated memory for another future of the same type (0 heap allocations)
@@ -89,7 +88,8 @@
 //! | **Cross-Type Switching** | **Yes (freely switch between `T1`, `T2`, `T3` with 0 re-allocations)** | ❌ No (strictly locked to a single type `T`) |
 //! | **Idle / Pending State** | **Yes (`is_empty()`, default is ZST `Pending`)** | ❌ No (must always contain an active future) |
 //! | **In-place Reset** | **Yes (`reset()`)** | ❌ No |
-//! | **Cancellation Safety in `select!`** | **Yes (`if !slot.is_empty()`)** | ⚠️ Awkward / Error-prone |
+//! | **Cancellation Safety in `select!`** | **Yes (`res = &mut slot =>`, auto-reset, no guard needed)** | ⚠️ Awkward / Error-prone |
+//! | **Fused & Unfused Modes** | **Yes (`.fused()` default, `.unfused()` for multi-step)** | ❌ No |
 //! | **Two Usage Models** | **Flexible: hold `ReusableFuture` (multi-type) OR `ReusableFutureRef` (single-type)** | ❌ Only single typed struct |
 //! | **Single-Threaded Optimization** | **Yes (`ReusableRcFuture`, zero atomics)** | ❌ No (`Send` only) |
 //! | **Arc Optimization** | **Optional `triomphe::Arc` (1 word pointer)** | Standard `alloc::sync::Arc` (2 words) |
@@ -125,9 +125,9 @@
 //!
 //!     tokio::select! {
 //!         biased;
-//!         // Poll the in-flight connection only when active
-//!         res = &mut conn_slot, if !conn_slot.is_empty() => {
-//!             conn_slot.reset(); // Reset to idle and reclaim buffer
+//!         // Auto-resets to idle on completion! When empty, it returns Poll::Pending
+//!         // so no `if guard` or manual reset() is required.
+//!         res = &mut conn_slot => {
 //!             assert_eq!(res, "connected");
 //!             break;
 //!         }
@@ -139,8 +139,22 @@
 //!     }
 //! }
 //! assert!(ticks > 0);
+//! assert!(conn_slot.is_empty());
 //! # }
 //! ```
+//!
+//! ---
+//!
+//! ## 🔄 Fused vs Unfused Modes
+//!
+//! * **Fused mode (Default / `.fused()`)**:
+//!   When polled to completion (`Poll::Ready`), the slot automatically resets to the idle/empty state
+//!   reclaiming memory for reuse. When idle, polling yields `Poll::Pending`. You can poll `&mut slot` directly
+//!   or call `slot.fused()`.
+//! * **Unfused mode (`.unfused()`)**:
+//!   When polled via `slot.unfused()`, returning `Poll::Ready` will **NOT** reset the slot. The future remains
+//!   intact and can be polled repeatedly (useful for custom multi-step state machines or streams) until
+//!   manually reset.
 
 use futures_util::future::Pending;
 use std::alloc::Layout;
@@ -199,6 +213,18 @@ pub struct ReusableFutureRef<'a, T> {
 
 unsafe impl<T: Send> Send for ReusableFutureRef<'_, T> {}
 
+/// An unfused borrowing adapter for `ReusableFutureRef`.
+///
+/// Unlike `ReusableFutureRef`'s default `Future` implementation which automatically
+/// calls `reset()` when returning `Poll::Ready`, `UnfusedReusableFutureRef` does NOT
+/// reset the future upon completion. This is useful for futures that support being polled
+/// multiple times (e.g. streaming or multi-step operations) or when custom reset timing is required.
+#[must_use]
+#[repr(transparent)]
+pub struct UnfusedReusableFutureRef<'b, 'a, T>(&'b mut ReusableFutureRef<'a, T>);
+
+unsafe impl<T: Send> Send for UnfusedReusableFutureRef<'_, '_, T> {}
+
 /// A reference-counted future container that allows reusing the underlying allocation
 /// for different futures, provided they fit within the initially allocated layout or
 /// a subsequently reallocated larger layout.
@@ -223,6 +249,11 @@ pub struct ReusableRcFutureRef<'a, T> {
     /// Phantom data to associate the lifetime 'a with the borrowed future type.
     _phantom: std::marker::PhantomData<&'a T>, // Use &'a T to tie the lifetime
 }
+
+/// An unfused borrowing adapter for `ReusableRcFutureRef`. Not thread-safe.
+#[must_use]
+#[repr(transparent)]
+pub struct UnfusedReusableRcFutureRef<'b, 'a, T>(&'b mut ReusableRcFutureRef<'a, T>);
 
 #[cfg(any(target_pointer_width = "16", target_pointer_width = "32"))]
 type MinAlignType = f64;
@@ -322,6 +353,7 @@ macro_rules! impl_reusable_future {
     (
         $ReusableFuture:ident,
         $ReusableFutureRef:ident,
+        $UnfusedReusableFutureRef:ident,
         $Rc:ident,
         $atomic:literal,
         $($SendBound:tt)*
@@ -490,6 +522,10 @@ macro_rules! impl_reusable_future {
             type Output = T;
 
             /// Polls the underlying future.
+            ///
+            /// If the future completes with [`Poll::Ready`], this container automatically
+            /// calls [`reset()`](Self::reset) to drop the completed future and transition
+            /// back to the idle/empty state.
             fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
                 let this = Pin::into_inner(self);
 
@@ -497,14 +533,19 @@ macro_rules! impl_reusable_future {
                     return Poll::Pending;
                 }
 
-                // SAFETY: `dyn_ptr` points to a valid `Future` instance. The `ReusableFutureRef`
-                // ensures the data pointed to by `dyn_ptr` is valid for the lifetime of `self`.
-                // Pinning `dyn_ptr` is safe because the `ReusableFutureRef` itself is pinned,
-                // and the underlying `ReusableFuture` guarantees the allocation won't move
-                // while borrowed. The future `F` stored within the allocation is the one being polled.
-                let pin = unsafe { Pin::new_unchecked(&mut *this.dyn_ptr) };
-                // Poll the pinned future.
-                pin.poll(cx)
+                // SAFETY: `dyn_ptr` points to a valid `Future` instance.
+                let result = unsafe { Pin::new_unchecked(&mut *this.dyn_ptr) }.poll(cx);
+                if result.is_ready() {
+                    this.reset();
+                }
+                result
+            }
+        }
+
+        impl<T> futures_util::future::FusedFuture for $ReusableFutureRef<'_, T> {
+            #[inline(always)]
+            fn is_terminated(&self) -> bool {
+                self.is_empty()
             }
         }
 
@@ -517,7 +558,7 @@ macro_rules! impl_reusable_future {
             }
         }
 
-        impl<T> $ReusableFutureRef<'_, T> {
+        impl<'a, T> $ReusableFutureRef<'a, T> {
             /// Check if the underlying future is in an idle/empty state.
             ///
             /// Uses a null data-pointer sentinel to distinguish the reset/empty state
@@ -545,6 +586,27 @@ macro_rules! impl_reusable_future {
                 }
             }
 
+            /// Borrows the future in fused mode (auto-reset on completion).
+            ///
+            /// When polled to completion ([`Poll::Ready`]), it automatically calls [`reset()`](Self::reset)
+            /// to reclaim memory and transition back to idle. Since [`ReusableFutureRef`] is fused by default,
+            /// this method returns `&mut Self` for convenience and clear distinction from [`unfused()`](Self::unfused).
+            #[inline(always)]
+            pub fn fused(&mut self) -> &mut Self {
+                self
+            }
+
+            /// Borrows the future in unfused mode (without auto-reset).
+            ///
+            /// Unlike the default fused behavior, polling via `unfused()` does NOT call [`reset()`](Self::reset)
+            /// when the future returns [`Poll::Ready`]. The completed future remains inside the container,
+            /// allowing it to be polled again (for futures that support multiple completions or steps)
+            /// or manually reset at a custom time.
+            #[inline(always)]
+            pub fn unfused(&mut self) -> $UnfusedReusableFutureRef<'_, 'a, T> {
+                $UnfusedReusableFutureRef(self)
+            }
+
             /// Drop the `ReusableFutureRef` but reclaim the allocated memory.
             ///
             /// # Returns
@@ -552,6 +614,38 @@ macro_rules! impl_reusable_future {
             /// The `ReusableFuture` instance which holds the allocated (reusable) memory.
             pub fn reclaim(self) -> $ReusableFuture {
                 self.owner.clone()
+            }
+        }
+
+        impl<'b, 'a, T> std::ops::Deref for $UnfusedReusableFutureRef<'b, 'a, T> {
+            type Target = $ReusableFutureRef<'a, T>;
+
+            #[inline(always)]
+            fn deref(&self) -> &Self::Target {
+                self.0
+            }
+        }
+
+        impl<'b, 'a, T> std::ops::DerefMut for $UnfusedReusableFutureRef<'b, 'a, T> {
+            #[inline(always)]
+            fn deref_mut(&mut self) -> &mut Self::Target {
+                self.0
+            }
+        }
+
+        impl<T> Unpin for $UnfusedReusableFutureRef<'_, '_, T> {}
+
+        impl<T> Future for $UnfusedReusableFutureRef<'_, '_, T> {
+            type Output = T;
+
+            /// Polls the underlying future without resetting on [`Poll::Ready`].
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+                if self.0.is_empty() {
+                    return Poll::Pending;
+                }
+
+                // SAFETY: `dyn_ptr` points to a valid `Future` instance.
+                unsafe { Pin::new_unchecked(&mut *self.0.dyn_ptr) }.poll(cx)
             }
         }
 
@@ -614,5 +708,19 @@ macro_rules! impl_reusable_future {
     };
 }
 
-impl_reusable_future!(ReusableFuture, ReusableFutureRef, Arc, true, Send);
-impl_reusable_future!(ReusableRcFuture, ReusableRcFutureRef, Rc, false,);
+impl_reusable_future!(
+    ReusableFuture,
+    ReusableFutureRef,
+    UnfusedReusableFutureRef,
+    Arc,
+    true,
+    Send
+);
+
+impl_reusable_future!(
+    ReusableRcFuture,
+    ReusableRcFutureRef,
+    UnfusedReusableRcFutureRef,
+    Rc,
+    false,
+);
